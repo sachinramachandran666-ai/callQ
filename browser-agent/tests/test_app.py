@@ -61,3 +61,11 @@ def test_oversized_request_rejected():
  with TestClient(app) as c:
   r=c.post('/api/leads',headers={'Content-Length':str(2*1024*1024)})
   assert r.status_code==413
+
+def test_production_readiness_rejects_sqlite(monkeypatch):
+ import app as app_module
+ monkeypatch.setattr(app_module,'PROD',True)
+ with TestClient(app) as c:
+  r=c.get('/readyz')
+  assert r.status_code==503
+  assert 'PostgreSQL' in r.json()['detail']
