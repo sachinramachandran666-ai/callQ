@@ -34,7 +34,7 @@ def tenant_auth(req:Request):
  with engine.begin() as c: row=c.execute(text("SELECT id,name FROM tenants WHERE token_hash=:h AND active=TRUE"),{"h":digest(h[7:])}).mappings().first()
  if not row: raise HTTPException(401,"Invalid or inactive workspace token")
  return dict(row)
-@app.get("/",response_class=HTMLResponse)
+@app.api_route("/",methods=["GET","HEAD"],response_class=HTMLResponse)
 def home(): return (BASE/"static"/"index.html").read_text()
 @app.get("/health")
 def health(): return {"status":"ok","database":engine.dialect.name,"ai_configured":bool(os.getenv("OPENAI_API_KEY"))}
