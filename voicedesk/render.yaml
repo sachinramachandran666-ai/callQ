@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: voicedesk-mvp
+    runtime: docker
+    dockerfilePath: ./voicedesk/Dockerfile
+    dockerContext: ./voicedesk
+    plan: free
+    region: singapore
+    healthCheckPath: /health
+    envVars:
+      - key: OPENAI_MODEL
+        value: gpt-4o-mini
+      - key: BUSINESS_NAME
+        value: Demo Coaching Institute
+      - key: VOICE_LANGUAGE
+        value: en-IN
