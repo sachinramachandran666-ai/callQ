@@ -22,3 +22,29 @@ jobs:
           python-version: '3.12'
       - run: pip install -r requirements.txt
       - run: pytest -q
+
+  smoke:
+    runs-on: ubuntu-latest
+    needs: test
+    if: github.event_name == 'push'
+    steps:
+      - name: Smoke test deployed health endpoint
+        run: |
+          python - <<'PY'
+          import json, time, urllib.request
+          url = "https://leadpilot-pilot.onrender.com/health"
+          last_error = None
+          for attempt in range(6):
+              try:
+                  with urllib.request.urlopen(url, timeout=15) as response:
+                      assert response.status == 200, f"unexpected HTTP {response.status}"
+                      data = json.loads(response.read())
+                      assert data.get("status") == "ok", data
+                      print({"http": response.status, "health": data})
+                      break
+              except Exception as exc:
+                  last_error = exc
+                  if attempt == 5:
+                      raise
+                  time.sleep(5)
+          PY
