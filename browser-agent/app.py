@@ -2,7 +2,7 @@ import os, secrets, hashlib, json
 from contextlib import asynccontextmanager
 from pathlib import Path
 from fastapi import FastAPI, Depends, HTTPException, Request
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from sqlalchemy import create_engine, text
@@ -29,6 +29,22 @@ async def lifespan(app):
  init_db(); yield; engine.dispose()
 app=FastAPI(title="LeadPilot",version="0.1.0",docs_url=None,redoc_url=None,lifespan=lifespan)
 app.mount("/static",StaticFiles(directory=str(BASE/"static")),name="static")
+@app.middleware("http")
+async def security_and_size_middleware(request:Request, call_next):
+ length=request.headers.get("content-length")
+ if length:
+  try:
+   if int(length)>1024*1024:
+    return JSONResponse(status_code=413,content={"detail":"Request body too large"})
+  except ValueError:
+   return JSONResponse(status_code=400,content={"detail":"Invalid Content-Length"})
+ response=await call_next(request)
+ response.headers["X-Content-Type-Options"]="nosniff"
+ response.headers["X-Frame-Options"]="DENY"
+ response.headers["Referrer-Policy"]="strict-origin-when-cross-origin"
+ response.headers["Permissions-Policy"]="camera=(), microphone=(), geolocation=()"
+ if request.url.path.startswith("/api/"): response.headers["Cache-Control"]="no-store"
+ return response
 def tenant_auth(req:Request):
  h=req.headers.get("authorization","")
  if not h.startswith("Bearer ") or len(h[7:])<32: raise HTTPException(401,"Workspace token required")
@@ -39,6 +55,13 @@ def tenant_auth(req:Request):
 def home(): return (BASE/"static"/"index.html").read_text()
 @app.get("/health")
 def health(): return {"status":"ok","database":engine.dialect.name,"ai_configured":bool(os.getenv("OPENAI_API_KEY"))}
+@app.get("/readyz")
+def readiness():
+ try:
+  with engine.connect() as c: c.execute(text("SELECT 1"))
+  return {"status":"ready","database":"reachable"}
+ except Exception:
+  raise HTTPException(503,"Database is not ready")
 class LeadIn(BaseModel):
  company:str=Field(min_length=2,max_length=160)
  website:str=Field(default="",max_length=500)
