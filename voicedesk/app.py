@@ -1,4 +1,4 @@
-import os, json, sqlite3, time, html
+import os, json, sqlite3, time, html, secrets
 from contextlib import closing
 from pathlib import Path
 from fastapi import FastAPI, Request, HTTPException
@@ -6,6 +6,7 @@ from fastapi.responses import HTMLResponse, Response, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from openai import OpenAI
+from twilio.request_validator import RequestValidator
 
 APP_DIR = Path(__file__).parent
 DB_PATH = os.getenv("DB_PATH", "/tmp/voicedesk.db")
@@ -24,6 +25,25 @@ def db():
 
 def configured():
     return bool(os.getenv("OPENAI_API_KEY"))
+
+def require_admin(request: Request):
+    expected = os.getenv("ADMIN_TOKEN", "")
+    supplied = request.headers.get("authorization", "")
+    if not expected:
+        raise HTTPException(503, "Set ADMIN_TOKEN in Render environment variables before enabling lead access.")
+    if not supplied.startswith("Bearer ") or not secrets.compare_digest(supplied[7:], expected):
+        raise HTTPException(401, "Admin token required.")
+
+async def validate_twilio(request: Request, form):
+    token = os.getenv("TWILIO_AUTH_TOKEN", "")
+    if not token:
+        raise HTTPException(503, "Inbound calling is disabled until TWILIO_AUTH_TOKEN is configured.")
+    signature = request.headers.get("X-Twilio-Signature", "")
+    url = str(request.url)
+    if request.headers.get("x-forwarded-proto") == "https" and url.startswith("http://"):
+        url = "https://" + url[len("http://"):]
+    if not RequestValidator(token).validate(url, dict(form), signature):
+        raise HTTPException(403, "Invalid telephony provider signature.")
 
 def twiml_gather(prompt="Hello, you've reached the admissions assistant. How can I help you today?"):
     safe = html.escape(prompt)
@@ -78,9 +98,10 @@ def system_prompt():
 
 @app.post("/voice")
 async def voice(request: Request):
+    form = await request.form()
+    await validate_twilio(request, form)
     if not configured():
         return twiml_gather("This VoiceDesk demo is not connected to its AI service yet. Please configure the service before accepting customer calls.")
-    form = await request.form()
     call_sid = str(form.get("CallSid",""))
     sessions[call_sid] = []
     return twiml_gather()
@@ -88,6 +109,7 @@ async def voice(request: Request):
 @app.post("/voice/turn")
 async def voice_turn(request: Request):
     form = await request.form()
+    await validate_twilio(request, form)
     call_sid = str(form.get("CallSid","unknown"))
     speech = str(form.get("SpeechResult","")).strip()
     if not speech:
@@ -110,7 +132,8 @@ async def voice_turn(request: Request):
         return twiml_gather("I'm having trouble accessing the admissions information. I can arrange a callback. Please try again later.")
 
 @app.get("/api/leads")
-def get_leads():
+def get_leads(request: Request):
+    require_admin(request)
     with closing(db()) as conn:
         rows=conn.execute("SELECT id,created_at,name,phone,interest,source,status FROM leads ORDER BY id DESC LIMIT 100").fetchall()
         return {"leads":[dict(row) for row in rows]}
@@ -121,7 +144,8 @@ class LeadIn(BaseModel):
     interest: str = ""
 
 @app.post("/api/leads")
-def create_lead(lead: LeadIn):
+def create_lead(lead: LeadIn, request: Request):
+    require_admin(request)
     if len(lead.name.strip()) < 2 or len(lead.phone.strip()) < 7:
         raise HTTPException(400,"Enter a valid name and phone number")
     with closing(db()) as conn:
