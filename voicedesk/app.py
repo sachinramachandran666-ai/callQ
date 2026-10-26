@@ -51,7 +51,7 @@ def twiml_gather(prompt="Hello, you've reached the admissions assistant. How can
 <Response><Gather input="speech" action="/voice/turn" method="POST" language="{html.escape(os.getenv("VOICE_LANGUAGE","en-IN"))}" speechTimeout="auto" timeout="7"><Say>{safe}</Say></Gather><Say>Sorry, I didn't hear anything. Please call again.</Say><Hangup/></Response>'''
     return Response(content=xml, media_type="application/xml")
 
-@app.get("/", response_class=HTMLResponse)
+@app.api_route("/", methods=["GET", "HEAD"], response_class=HTMLResponse)
 def home():
     return (APP_DIR / "static" / "index.html").read_text(encoding="utf-8")
 
