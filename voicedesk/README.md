@@ -27,3 +27,19 @@ A deployable inbound voice-agent starter for Indian coaching institutes. FastAPI
 - Live calling requires a Twilio account/number and paid voice/API usage
 
 Do not use for real customer calls until the security, persistence, consent and cost controls above are addressed.
+
+## Production release gate (not yet passed)
+- [x] Public dashboard and container build
+- [x] Admin-token gate for lead endpoints and AI text demo
+- [x] Twilio request-signature check
+- [x] Live calling disabled unless ENABLE_LIVE_CALLS=true
+- [x] Maximum call turns; basic regression tests added (execution not yet verified)
+- [ ] Durable encrypted database, backups, restore test and retention deletion
+- [ ] Multi-tenant isolation with per-tenant RBAC and automated negative tests
+- [ ] Per-tenant usage quotas, billing and hard spending caps
+- [ ] Call-state persistence, idempotency and concurrency/load tests
+- [ ] Consent and legal/privacy review for recording, retention and outbound communications
+- [ ] End-to-end Twilio live-call validation and AI quality evaluation
+- [ ] Verified CI test run, monitoring, alerts and incident runbook
+
+Do not set ENABLE_LIVE_CALLS=true or accept real customer data until every mandatory gate passes.
