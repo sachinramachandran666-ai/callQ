@@ -1,0 +1,24 @@
+name: Browser Agent CI
+on:
+  push:
+    branches: [browser-agent-mvp]
+    paths:
+      - 'browser-agent/**'
+      - '.github/workflows/browser-agent-ci.yml'
+  pull_request:
+    paths:
+      - 'browser-agent/**'
+      - '.github/workflows/browser-agent-ci.yml'
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: browser-agent
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install -r requirements.txt
+      - run: pytest -q
