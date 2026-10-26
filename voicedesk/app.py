@@ -11,7 +11,7 @@ from openai import OpenAI
 from twilio.request_validator import RequestValidator
 
 URL=os.getenv("DATABASE_URL","")
-PROD=os.getenv("APP_ENV")=="production" or os.getenv("RENDER")=="true"
+PROD=os.getenv("APP_ENV")=="production"
 if URL.startswith("postgres://"): URL=URL.replace("postgres://","postgresql+psycopg://",1)
 elif URL.startswith("postgresql://"): URL=URL.replace("postgresql://","postgresql+psycopg://",1)
 if not URL and PROD: raise RuntimeError("DATABASE_URL required in production; refusing ephemeral storage.")
