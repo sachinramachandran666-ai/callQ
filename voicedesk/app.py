@@ -1,168 +1,129 @@
-import os, json, sqlite3, time, html, secrets
-from contextlib import closing
+import os,html,secrets,hashlib,hmac,json
 from pathlib import Path
-from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import HTMLResponse, Response, JSONResponse
+from contextlib import asynccontextmanager
+from fastapi import FastAPI,Request,HTTPException,Depends
+from fastapi.responses import HTMLResponse,Response
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel,Field
+from sqlalchemy import create_engine,text
+from sqlalchemy.exc import IntegrityError
 from openai import OpenAI
 from twilio.request_validator import RequestValidator
 
-APP_DIR = Path(__file__).parent
-DB_PATH = os.getenv("DB_PATH", "/tmp/voicedesk.db")
-app = FastAPI(title="VoiceDesk", version="0.2.0", docs_url=None, redoc_url=None)
-app.mount("/static", StaticFiles(directory=str(APP_DIR / "static")), name="static")
-sessions = {}
-MAX_CALL_TURNS = int(os.getenv("MAX_CALL_TURNS", "12"))
-MAX_DEMO_CHARS = 500
-
-
-def db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    conn.execute("""CREATE TABLE IF NOT EXISTS leads (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-        name TEXT, phone TEXT, interest TEXT, source TEXT DEFAULT 'voice', status TEXT DEFAULT 'new'
-    )""")
-    return conn
-
-def configured():
-    return bool(os.getenv("OPENAI_API_KEY"))
-
-def require_admin(request: Request):
-    expected = os.getenv("ADMIN_TOKEN", "")
-    supplied = request.headers.get("authorization", "")
-    if not expected:
-        raise HTTPException(503, "Set ADMIN_TOKEN in Render environment variables before enabling lead access.")
-    if not supplied.startswith("Bearer ") or not secrets.compare_digest(supplied[7:], expected):
-        raise HTTPException(401, "Admin token required.")
-
-async def validate_twilio(request: Request, form):
-    token = os.getenv("TWILIO_AUTH_TOKEN", "")
-    if not token:
-        raise HTTPException(503, "Inbound calling is disabled until TWILIO_AUTH_TOKEN is configured.")
-    signature = request.headers.get("X-Twilio-Signature", "")
-    url = str(request.url)
-    if request.headers.get("x-forwarded-proto") == "https" and url.startswith("http://"):
-        url = "https://" + url[len("http://"):]
-    if not RequestValidator(token).validate(url, dict(form), signature):
-        raise HTTPException(403, "Invalid telephony provider signature.")
-
-def twiml_gather(prompt="Hello, you've reached the admissions assistant. How can I help you today?"):
-    safe = html.escape(prompt)
-    xml = f'''<?xml version="1.0" encoding="UTF-8"?>
-<Response><Gather input="speech" action="/voice/turn" method="POST" language="{html.escape(os.getenv("VOICE_LANGUAGE","en-IN"))}" speechTimeout="auto" timeout="7"><Say>{safe}</Say></Gather><Say>Sorry, I didn't hear anything. Please call again.</Say><Hangup/></Response>'''
-    return Response(content=xml, media_type="application/xml")
-
-@app.api_route("/", methods=["GET", "HEAD"], response_class=HTMLResponse)
-def home():
-    return (APP_DIR / "static" / "index.html").read_text(encoding="utf-8")
-
+URL=os.getenv("DATABASE_URL","")
+PROD=os.getenv("APP_ENV")=="production" or os.getenv("RENDER")=="true"
+if URL.startswith("postgres://"): URL=URL.replace("postgres://","postgresql+psycopg://",1)
+elif URL.startswith("postgresql://"): URL=URL.replace("postgresql://","postgresql+psycopg://",1)
+if not URL and PROD: raise RuntimeError("DATABASE_URL required in production; refusing ephemeral storage.")
+engine=create_engine(URL or "sqlite:///./voicedesk-dev.db",pool_pre_ping=True,connect_args={"check_same_thread":False} if not URL else {})
+BASE=Path(__file__).parent
+def init_db():
+ with engine.begin() as c:
+  c.execute(text("CREATE TABLE IF NOT EXISTS tenants(id TEXT PRIMARY KEY,name TEXT NOT NULL,token_hash TEXT NOT NULL UNIQUE,active BOOLEAN NOT NULL DEFAULT TRUE,monthly_limit INTEGER NOT NULL DEFAULT 800,monthly_used INTEGER NOT NULL DEFAULT 0,business_faq TEXT NOT NULL DEFAULT '',phone_number TEXT UNIQUE)"))
+  c.execute(text("CREATE TABLE IF NOT EXISTS leads(id TEXT PRIMARY KEY,tenant_id TEXT NOT NULL REFERENCES tenants(id),name TEXT NOT NULL,phone TEXT NOT NULL,interest TEXT NOT NULL DEFAULT '',source TEXT NOT NULL DEFAULT 'manual',status TEXT NOT NULL DEFAULT 'new',created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP)"))
+  c.execute(text("CREATE TABLE IF NOT EXISTS calls(call_sid TEXT PRIMARY KEY,tenant_id TEXT NOT NULL REFERENCES tenants(id),status TEXT NOT NULL DEFAULT 'in_progress',turns INTEGER NOT NULL DEFAULT 0,history TEXT NOT NULL DEFAULT '[]')"))
+  c.execute(text("CREATE TABLE IF NOT EXISTS usage_events(id TEXT PRIMARY KEY,tenant_id TEXT NOT NULL REFERENCES tenants(id),call_sid TEXT,kind TEXT NOT NULL,units INTEGER NOT NULL DEFAULT 1,created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP)"))
+  tok=os.getenv("BOOTSTRAP_TENANT_TOKEN","")
+  if len(tok)>=32:
+   c.execute(text("INSERT INTO tenants(id,name,token_hash,monthly_limit,business_faq) VALUES('default',:n,:h,:l,:f) ON CONFLICT(id) DO NOTHING"),{"n":os.getenv("BUSINESS_NAME","Pilot Institute"),"h":hashlib.sha256(tok.encode()).hexdigest(),"l":int(os.getenv("DEFAULT_MONTHLY_MINUTES","800")),"f":os.getenv("COURSE_FAQ","Admissions will confirm fees and schedules.")})
+@asynccontextmanager
+async def lifespan(app):
+ init_db();yield;engine.dispose()
+app=FastAPI(title="VoiceDesk",version="1.0.0",docs_url=None,redoc_url=None,lifespan=lifespan)
+app.mount("/static",StaticFiles(directory=str(BASE/"static")),name="static")
+def digest(v): return hashlib.sha256(v.encode()).hexdigest()
+def tenant_auth(req:Request):
+ h=req.headers.get("authorization","")
+ if not h.startswith("Bearer ") or len(h)<27: raise HTTPException(401,"Tenant bearer token required")
+ with engine.begin() as c: r=c.execute(text("SELECT * FROM tenants WHERE token_hash=:h AND active=TRUE"),{"h":digest(h[7:])}).mappings().first()
+ if not r: raise HTTPException(401,"Invalid or inactive tenant token")
+ return dict(r)
+def control_auth(req:Request):
+ expected=os.getenv("CONTROL_PLANE_TOKEN",""); h=req.headers.get("authorization","")
+ if len(expected)<32 or not h.startswith("Bearer ") or not hmac.compare_digest(h[7:],expected): raise HTTPException(403,"Control-plane access unavailable")
+def ready(): return bool(os.getenv("OPENAI_API_KEY"))
+def live(): return os.getenv("ENABLE_LIVE_CALLS","").lower()=="true"
+def prompt(t): return "Receptionist for "+t["name"]+". Approved facts only: "+(t.get("business_faq") or "Admissions will confirm details.")+". Never invent fees, schedules or guarantees. If unsure offer human callback. Be concise."
+def twiml(s,end=False):
+ s=html.escape(s); body=f"<Response><Say>{s}</Say><Hangup/></Response>" if end else f'<Response><Gather input="speech" action="/voice/turn" method="POST" language="{html.escape(os.getenv("VOICE_LANGUAGE","en-IN"))}" speechTimeout="auto" timeout="7"><Say>{s}</Say></Gather><Say>Goodbye.</Say><Hangup/></Response>'
+ return Response('<?xml version="1.0" encoding="UTF-8"?>'+body,media_type="application/xml")
+async def verify_twilio(req,form):
+ token=os.getenv("TWILIO_AUTH_TOKEN","")
+ if not token: raise HTTPException(503,"Telephony not configured")
+ url=str(req.url)
+ if req.headers.get("x-forwarded-proto")=="https" and url.startswith("http://"): url="https://"+url[7:]
+ if not RequestValidator(token).validate(url,dict(form),req.headers.get("X-Twilio-Signature","")): raise HTTPException(403,"Invalid provider signature")
+@app.api_route("/",methods=["GET","HEAD"],response_class=HTMLResponse)
+def home(): return (BASE/"static"/"index.html").read_text()
 @app.get("/health")
-def health():
-    return {"status":"ok","app":"voicedesk","version":"0.2.0","ai_configured":configured(),"mode":"live" if configured() else "demo","live_calls_enabled":os.getenv("ENABLE_LIVE_CALLS", "").lower() == "true"}
-
+def health(): return {"status":"ok","version":"1.0.0","database":engine.dialect.name,"ai_configured":ready(),"live_calls_enabled":live()}
 @app.get("/api/status")
-def status():
-    return {"mode":"live" if configured() else "demo","ai_configured":configured(),\n      "live_calls_enabled": os.getenv("ENABLE_LIVE_CALLS", "").lower() == "true",
-      "business_name":os.getenv("BUSINESS_NAME","Demo Coaching Institute"),
-      "language":os.getenv("VOICE_LANGUAGE","en-IN"),
-      "telephony_configured":bool(os.getenv("TWILIO_AUTH_TOKEN")),
-      "storage":"local SQLite (ephemeral on default Render filesystem); configure persistent storage before production"}
-
-class DemoMessage(BaseModel):
-    message: str
-
+def status(t=Depends(tenant_auth)): return {"mode":"live" if ready() else "demo","ai_configured":ready(),"live_calls_enabled":live(),"business_name":t["name"],"language":os.getenv("VOICE_LANGUAGE","en-IN"),"telephony_configured":bool(t.get("phone_number") and os.getenv("TWILIO_AUTH_TOKEN")),"monthly_limit":t["monthly_limit"],"monthly_used":t["monthly_used"]}
+class Demo(BaseModel): message:str=Field(min_length=1,max_length=500)
 @app.post("/api/demo")
-def demo(body: DemoMessage, request: Request):\n    require_admin(request)
-    if len(body.message) > MAX_DEMO_CHARS:\n        raise HTTPException(413, "Message exceeds 500 characters")\n    if not body.message.strip():
-        raise HTTPException(400,"Message cannot be empty")
-    if not configured():
-        return {"mode":"demo","reply":"Demo mode is active. Add OPENAI_API_KEY to enable live AI responses. Your message was not sent to an AI provider.","lead":None}
-    try:
-        client=OpenAI(api_key=os.environ["OPENAI_API_KEY"])
-        completion=client.chat.completions.create(
-            model=os.getenv("OPENAI_MODEL","gpt-4o-mini"),
-            messages=[
-              {"role":"system","content":system_prompt()},
-              {"role":"user","content":body.message}
-            ], temperature=0.2)
-        return {"mode":"live","reply":completion.choices[0].message.content or ""}
-    except Exception as e:
-        raise HTTPException(502,"AI provider request failed; check server logs and API configuration.") from e
-
-def system_prompt():
-    business=os.getenv("BUSINESS_NAME","Demo Coaching Institute")
-    courses=os.getenv("COURSE_FAQ","We offer online and classroom coaching. Fees and schedules are confirmed by the admissions team.")
-    return ("You are the inbound phone receptionist for "+business+". Be concise, polite, and clear. "
-      "Only use these approved business facts: "+courses+" Never invent fees, discounts, guarantees, eligibility, or schedules. "
-      "If unsure, say the admissions team will confirm and offer a callback. Ask one question at a time. "
-      "Collect a caller's name, phone number and course interest only when relevant. Do not request sensitive personal data.")
-
-@app.post("/voice")
-async def voice(request: Request):
-    form = await request.form()
-    await validate_twilio(request, form)
-    if not configured():
-        return twiml_gather("This VoiceDesk demo is not connected to its AI service yet. Please configure the service before accepting customer calls.")
-    call_sid = str(form.get("CallSid",""))
-    sessions[call_sid] = []
-    return twiml_gather()
-
-@app.post("/voice/turn")
-async def voice_turn(request: Request):
-    form = await request.form()
-    await validate_twilio(request, form)
-    call_sid = str(form.get("CallSid","unknown"))
-    speech = str(form.get("SpeechResult","")).strip()
-    if not speech:
-        return twiml_gather("I didn't catch that. Could you please repeat?")
-    if not configured():
-        return twiml_gather("The AI service is not configured yet. Please call back later.")
-    history = sessions.setdefault(call_sid, [])
-    history.append({"role":"user","content":speech})
-    try:
-        client=OpenAI(api_key=os.environ["OPENAI_API_KEY"])
-        completion=client.chat.completions.create(
-            model=os.getenv("OPENAI_MODEL","gpt-4o-mini"),
-            messages=[{"role":"system","content":system_prompt()},*history[-12:]],
-            temperature=0.2)
-        reply=(completion.choices[0].message.content or "I can arrange for the admissions team to call you back.").strip()
-        history.append({"role":"assistant","content":reply})
-        if len(history)>16: sessions[call_sid]=history[-16:]
-        return twiml_gather(reply)
-    except Exception:
-        return twiml_gather("I'm having trouble accessing the admissions information. I can arrange a callback. Please try again later.")
-
+def demo(b:Demo,t=Depends(tenant_auth)):
+ if not ready(): return {"mode":"demo","reply":"AI not configured; no AI request was made"}
+ try:
+  r=OpenAI(api_key=os.environ["OPENAI_API_KEY"]).chat.completions.create(model=os.getenv("OPENAI_MODEL","gpt-4o-mini"),messages=[{"role":"system","content":prompt(t)},{"role":"user","content":b.message}],temperature=.2,max_tokens=250)
+  return {"mode":"live","reply":r.choices[0].message.content or ""}
+ except Exception as e: raise HTTPException(502,"AI provider request failed") from e
+class Lead(BaseModel):
+ name:str=Field(min_length=2,max_length=100);phone:str=Field(min_length=7,max_length=32);interest:str=Field(default="",max_length=300)
 @app.get("/api/leads")
-def get_leads(request: Request):
-    require_admin(request)
-    with closing(db()) as conn:
-        rows=conn.execute("SELECT id,created_at,name,phone,interest,source,status FROM leads ORDER BY id DESC LIMIT 100").fetchall()
-        return {"leads":[dict(row) for row in rows]}
-
-class LeadIn(BaseModel):
-    name: str
-    phone: str
-    interest: str = ""
-
+def leads(t=Depends(tenant_auth)):
+ with engine.begin() as c: rows=c.execute(text("SELECT id,created_at,name,phone,interest,source,status FROM leads WHERE tenant_id=:t ORDER BY created_at DESC LIMIT 100"),{"t":t["id"]}).mappings().all()
+ return {"leads":[dict(x) for x in rows]}
 @app.post("/api/leads")
-def create_lead(lead: LeadIn, request: Request):
-    require_admin(request)
-    if len(lead.name.strip()) < 2 or len(lead.phone.strip()) < 7:
-        raise HTTPException(400,"Enter a valid name and phone number")
-    with closing(db()) as conn:
-        cur=conn.execute("INSERT INTO leads(name,phone,interest) VALUES(?,?,?)",
-          (lead.name.strip()[:100],lead.phone.strip()[:32],lead.interest.strip()[:300]))
-        conn.commit()
-        row=conn.execute("SELECT id,created_at,name,phone,interest,source,status FROM leads WHERE id=?",(cur.lastrowid,)).fetchone()
-        return dict(row)
-
-@app.patch("/api/leads/{lead_id}")
-def update_lead(lead_id: int, request: Request):
-    raise HTTPException(501,"Lead status editing will be enabled after authentication is added.")
-
-@app.get("/privacy", response_class=HTMLResponse)
-def privacy():
-    return """<h1>VoiceDesk privacy notice</h1><p>This MVP should only be used with appropriate notice and consent. Do not submit sensitive personal data. The demo lead form stores details in a local SQLite database that may be lost when the hosting instance restarts. Configure persistent encrypted storage, access controls, a retention policy and required notices before production use.</p>"""
-
+def add_lead(b:Lead,t=Depends(tenant_auth)):
+ ident=secrets.token_hex(16)
+ with engine.begin() as c:
+  c.execute(text("INSERT INTO leads(id,tenant_id,name,phone,interest) VALUES(:id,:t,:n,:p,:i)"),{"id":ident,"t":t["id"],"n":b.name.strip(),"p":b.phone.strip(),"i":b.interest.strip()})
+  r=c.execute(text("SELECT id,created_at,name,phone,interest,source,status FROM leads WHERE id=:id AND tenant_id=:t"),{"id":ident,"t":t["id"]}).mappings().first()
+ return dict(r)
+class NewTenant(BaseModel):
+ id:str=Field(pattern=r"^[a-z0-9][a-z0-9_-]{2,49}$");name:str=Field(min_length=2,max_length=100);token:str=Field(min_length=32,max_length=200);monthly_limit:int=Field(default=800,ge=1,le=100000);business_faq:str=Field(default="",max_length=10000);phone_number:str=Field(default="",max_length=40)
+@app.post("/control/tenants")
+def new_tenant(b:NewTenant,_=Depends(control_auth)):
+ try:
+  with engine.begin() as c: c.execute(text("INSERT INTO tenants(id,name,token_hash,monthly_limit,business_faq,phone_number) VALUES(:id,:n,:h,:l,:f,:p)"),{"id":b.id,"n":b.name,"h":digest(b.token),"l":b.monthly_limit,"f":b.business_faq,"p":b.phone_number or None})
+ except IntegrityError as e: raise HTTPException(409,"Tenant id or phone already exists") from e
+ return {"id":b.id,"name":b.name,"active":True,"monthly_limit":b.monthly_limit}
+@app.post("/control/tenants/{tid}/disable")
+def disable(tid:str,_=Depends(control_auth)):
+ with engine.begin() as c: n=c.execute(text("UPDATE tenants SET active=FALSE WHERE id=:id"),{"id":tid}).rowcount
+ if not n: raise HTTPException(404,"Tenant not found")
+ return {"id":tid,"active":False}
+def phone_tenant(phone):
+ with engine.begin() as c: r=c.execute(text("SELECT * FROM tenants WHERE phone_number=:p AND active=TRUE"),{"p":phone}).mappings().first()
+ return dict(r) if r else None
+@app.post("/voice")
+async def voice(req:Request):
+ f=await req.form();await verify_twilio(req,f)
+ if not live() or not ready(): raise HTTPException(503,"Live calling disabled pending production sign-off")
+ t=phone_tenant(str(f.get("To","")));sid=str(f.get("CallSid",""))
+ if not t or not sid: raise HTTPException(404,"No tenant configured for this number")
+ with engine.begin() as c: c.execute(text("INSERT INTO calls(call_sid,tenant_id,history) VALUES(:s,:t,'[]') ON CONFLICT(call_sid) DO NOTHING"),{"s":sid,"t":t["id"]})
+ return twiml("Hello, you've reached "+t["name"]+". How can I help?")
+@app.post("/voice/turn")
+async def turn(req:Request):
+ f=await req.form();await verify_twilio(req,f)
+ if not live() or not ready(): raise HTTPException(503,"Live calling disabled")
+ sid=str(f.get("CallSid",""));speech=str(f.get("SpeechResult","")).strip()[:1000]
+ with engine.begin() as c: call=c.execute(text("SELECT c.*,t.name,t.business_faq,t.monthly_limit,t.monthly_used,t.active FROM calls c JOIN tenants t ON t.id=c.tenant_id WHERE c.call_sid=:s"),{"s":sid}).mappings().first()
+ if not call or not call["active"]: raise HTTPException(404,"Unknown call or inactive tenant")
+ if call["turns"]>=12: return twiml("Thank you. Our team will follow up. Goodbye.",True)
+ if call["monthly_used"]>=call["monthly_limit"]: return twiml("Automated assistant unavailable. Please contact the team. Goodbye.",True)
+ if not speech:return twiml("I didn't catch that. Could you repeat?")
+ hist=json.loads(call["history"] or "[]");t={"name":call["name"],"business_faq":call["business_faq"]}
+ try:
+  r=OpenAI(api_key=os.environ["OPENAI_API_KEY"]).chat.completions.create(model=os.getenv("OPENAI_MODEL","gpt-4o-mini"),messages=[{"role":"system","content":prompt(t)},*hist[-10:],{"role":"user","content":speech}],temperature=.2,max_tokens=220);reply=(r.choices[0].message.content or "Our team can confirm. Goodbye.")[:1000]
+ except Exception:return twiml("I cannot access that information. Please contact the team. Goodbye.",True)
+ hist.extend([{"role":"user","content":speech},{"role":"assistant","content":reply}])
+ with engine.begin() as c:
+  n=c.execute(text("UPDATE tenants SET monthly_used=monthly_used+1 WHERE id=:t AND active=TRUE AND monthly_used<monthly_limit"),{"t":call["tenant_id"]}).rowcount
+  if not n:return twiml("Automated assistant unavailable. Goodbye.",True)
+  c.execute(text("UPDATE calls SET turns=turns+1,history=:h WHERE call_sid=:s AND status='in_progress'"),{"h":json.dumps(hist[-12:]),"s":sid})
+  c.execute(text("INSERT INTO usage_events(id,tenant_id,call_sid,kind,units) VALUES(:id,:t,:s,'voice_turn',1)"),{"id":secrets.token_hex(16),"t":call["tenant_id"],"s":sid})
+ return twiml(reply)
+@app.get("/privacy",response_class=HTMLResponse)
+def privacy():return "<h1>VoiceDesk privacy</h1><p>Publish a customer-specific notice and establish consent, retention, deletion and applicable privacy/telecom compliance before production use.</p>"
