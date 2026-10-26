@@ -10,9 +10,12 @@ from twilio.request_validator import RequestValidator
 
 APP_DIR = Path(__file__).parent
 DB_PATH = os.getenv("DB_PATH", "/tmp/voicedesk.db")
-app = FastAPI(title="VoiceDesk", version="0.1.0")
+app = FastAPI(title="VoiceDesk", version="0.2.0", docs_url=None, redoc_url=None)
 app.mount("/static", StaticFiles(directory=str(APP_DIR / "static")), name="static")
 sessions = {}
+MAX_CALL_TURNS = int(os.getenv("MAX_CALL_TURNS", "12"))
+MAX_DEMO_CHARS = 500
+
 
 def db():
     conn = sqlite3.connect(DB_PATH)
@@ -57,11 +60,11 @@ def home():
 
 @app.get("/health")
 def health():
-    return {"status":"ok","app":"voicedesk","version":"0.1.0","ai_configured":configured(),"mode":"live" if configured() else "demo"}
+    return {"status":"ok","app":"voicedesk","version":"0.2.0","ai_configured":configured(),"mode":"live" if configured() else "demo","live_calls_enabled":os.getenv("ENABLE_LIVE_CALLS", "").lower() == "true"}
 
 @app.get("/api/status")
 def status():
-    return {"mode":"live" if configured() else "demo","ai_configured":configured(),
+    return {"mode":"live" if configured() else "demo","ai_configured":configured(),\n      "live_calls_enabled": os.getenv("ENABLE_LIVE_CALLS", "").lower() == "true",
       "business_name":os.getenv("BUSINESS_NAME","Demo Coaching Institute"),
       "language":os.getenv("VOICE_LANGUAGE","en-IN"),
       "telephony_configured":bool(os.getenv("TWILIO_AUTH_TOKEN")),
@@ -71,8 +74,8 @@ class DemoMessage(BaseModel):
     message: str
 
 @app.post("/api/demo")
-def demo(body: DemoMessage):
-    if not body.message.strip():
+def demo(body: DemoMessage, request: Request):\n    require_admin(request)
+    if len(body.message) > MAX_DEMO_CHARS:\n        raise HTTPException(413, "Message exceeds 500 characters")\n    if not body.message.strip():
         raise HTTPException(400,"Message cannot be empty")
     if not configured():
         return {"mode":"demo","reply":"Demo mode is active. Add OPENAI_API_KEY to enable live AI responses. Your message was not sent to an AI provider.","lead":None}
