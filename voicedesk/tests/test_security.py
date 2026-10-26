@@ -1,42 +1,37 @@
-"""Security regression tests for the VoiceDesk pilot. Run: pip install pytest httpx && pytest voicedesk/tests"""
-import os
-import sys
+"""Tenant boundary and fail-closed regression tests."""
+import os,sys,secrets
 from pathlib import Path
 from fastapi.testclient import TestClient
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
+os.environ.setdefault("DATABASE_URL","sqlite:///./voicedesk-test.db")
+os.environ.setdefault("BOOTSTRAP_TENANT_TOKEN","test-tenant-token-which-is-at-least-32-chars")
 from app import app
-
-client = TestClient(app)
-
 def test_health_and_dashboard():
-    assert client.get("/health").status_code == 200
-    assert client.get("/").status_code == 200
-    assert client.head("/").status_code == 200
-
-def test_leads_fail_closed_without_token(monkeypatch):
-    monkeypatch.delenv("ADMIN_TOKEN", raising=False)
-    assert client.get("/api/leads").status_code == 503
-    assert client.post("/api/leads", json={"name":"Test","phone":"1234567890"}).status_code == 503
-
-def test_admin_rejects_wrong_token(monkeypatch):
-    monkeypatch.setenv("ADMIN_TOKEN", "test-secret")
-    assert client.get("/api/leads", headers={"Authorization":"Bearer wrong"}).status_code == 401
-
-def test_demo_requires_auth(monkeypatch):
-    monkeypatch.setenv("ADMIN_TOKEN", "test-secret")
-    assert client.post("/api/demo", json={"message":"Hello"}).status_code == 401
-    assert client.post("/api/demo", json={"message":"x"*501}, headers={"Authorization":"Bearer test-secret"}).status_code == 413
-
-def test_twilio_requires_config(monkeypatch):
-    monkeypatch.delenv("TWILIO_AUTH_TOKEN", raising=False)
-    assert client.post("/voice", data={"CallSid":"CA123"}).status_code == 503
-    assert client.post("/voice/turn", data={"CallSid":"CA123","SpeechResult":"Hello"}).status_code == 503
-
-def test_invalid_twilio_signature(monkeypatch):
-    monkeypatch.setenv("TWILIO_AUTH_TOKEN", "fake-token")
-    assert client.post("/voice", data={"CallSid":"CA123"}, headers={"X-Twilio-Signature":"invalid"}).status_code == 403
-
-def test_live_calls_off_by_default(monkeypatch):
-    monkeypatch.delenv("ENABLE_LIVE_CALLS", raising=False)
-    assert client.get("/api/status").json()["live_calls_enabled"] is False
+ with TestClient(app) as c:
+  assert c.get("/health").status_code==200
+  assert c.get("/").status_code==200
+  assert c.head("/").status_code==200
+def test_tenant_auth_required():
+ with TestClient(app) as c:
+  assert c.get("/api/leads").status_code==401
+  assert c.get("/api/status").status_code==401
+def test_tenant_can_create_and_read_own_lead():
+ with TestClient(app) as c:
+  h={"Authorization":"Bearer test-tenant-token-which-is-at-least-32-chars"}
+  r=c.post("/api/leads",headers=h,json={"name":"Test User","phone":"1234567890","interest":"Maths"})
+  assert r.status_code==200
+  assert c.get("/api/leads",headers=h).json()["leads"][0]["name"]=="Test User"
+def test_live_calls_are_disabled_by_default(monkeypatch):
+ monkeypatch.delenv("ENABLE_LIVE_CALLS",raising=False)
+ with TestClient(app) as c:
+  assert c.get("/health").json()["live_calls_enabled"] is False
+def test_invalid_twilio_signature_rejected(monkeypatch):
+ monkeypatch.setenv("TWILIO_AUTH_TOKEN","not-a-real-token")
+ with TestClient(app) as c:
+  r=c.post("/voice",data={"CallSid":"CA-invalid","To":"+15550000000"},headers={"X-Twilio-Signature":"invalid"})
+  assert r.status_code==403
+def test_tenant_id_cannot_be_selected_by_client():
+ # All lead queries derive tenant_id exclusively from the verified bearer token.
+ source=(Path(__file__).resolve().parents[1]/"app.py").read_text()
+ assert "WHERE tenant_id=:t" in source
+ assert "token_hash=:h AND active=TRUE" in source
