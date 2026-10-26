@@ -22,7 +22,8 @@ def init_db():
   c.execute(text("CREATE TABLE IF NOT EXISTS leads (id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL REFERENCES tenants(id), company TEXT NOT NULL, website TEXT NOT NULL DEFAULT '', contact_name TEXT NOT NULL DEFAULT '', contact_email TEXT NOT NULL DEFAULT '', source_notes TEXT NOT NULL DEFAULT '', research_brief TEXT NOT NULL DEFAULT '', outreach_draft TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'new', created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP)"))
   token=os.getenv("BOOTSTRAP_TENANT_TOKEN","")
   if len(token)>=32:
-   c.execute(text("INSERT INTO tenants(id,name,token_hash) VALUES('default',:n,:h) ON CONFLICT(id) DO NOTHING"),{"n":os.getenv("BUSINESS_NAME","LeadPilot Workspace"),"h":digest(token)})
+   # Upsert so rotating the configured bootstrap secret actually invalidates the old token.
+   c.execute(text("INSERT INTO tenants(id,name,token_hash) VALUES('default',:n,:h) ON CONFLICT(id) DO UPDATE SET name=excluded.name, token_hash=excluded.token_hash, active=TRUE"),{"n":os.getenv("BUSINESS_NAME","LeadPilot Workspace"),"h":digest(token)})
 @asynccontextmanager
 async def lifespan(app):
  init_db(); yield; engine.dispose()
