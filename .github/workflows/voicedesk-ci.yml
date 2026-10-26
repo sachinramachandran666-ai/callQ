@@ -1,0 +1,27 @@
+name: VoiceDesk CI
+on:
+  push:
+    paths:
+      - 'voicedesk/**'
+      - '.github/workflows/voicedesk-ci.yml'
+  pull_request:
+    paths:
+      - 'voicedesk/**'
+      - '.github/workflows/voicedesk-ci.yml'
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: voicedesk
+    env:
+      DATABASE_URL: sqlite:///./voicedesk-ci.db
+      BOOTSTRAP_TENANT_TOKEN: ci-test-token-at-least-thirty-two-characters-long
+      ENABLE_LIVE_CALLS: 'false'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install -r requirements.txt
+      - run: pytest -q tests
