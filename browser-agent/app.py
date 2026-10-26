@@ -57,6 +57,8 @@ def home(): return (BASE/"static"/"index.html").read_text()
 def health(): return {"status":"ok","database":engine.dialect.name,"ai_configured":bool(os.getenv("OPENAI_API_KEY"))}
 @app.get("/readyz")
 def readiness():
+ if PROD and engine.dialect.name != "postgresql":
+  raise HTTPException(503,"Production requires durable PostgreSQL storage")
  try:
   with engine.connect() as c: c.execute(text("SELECT 1"))
   return {"status":"ready","database":"reachable"}
