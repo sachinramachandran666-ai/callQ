@@ -14,6 +14,9 @@ def ensure_other_tenant():
 def test_health_and_dashboard():
  with TestClient(app) as c:
   assert c.get('/health').status_code==200
+  assert c.get('/readyz').status_code==200
+  assert c.get('/health').headers['x-content-type-options']=='nosniff'
+  assert c.get('/health').headers['x-frame-options']=='DENY'
   assert c.get('/').status_code==200
   assert c.head('/').status_code==200
 def test_auth_required():
@@ -53,3 +56,8 @@ def test_bootstrap_token_rotation_updates_existing_workspace():
   assert c.get('/api/leads',headers={'Authorization':'Bearer '+os.environ["BOOTSTRAP_TENANT_TOKEN"]}).status_code==200
   os.environ["BOOTSTRAP_TENANT_TOKEN"]=TOKEN
   app_module.init_db()
+
+def test_oversized_request_rejected():
+ with TestClient(app) as c:
+  r=c.post('/api/leads',headers={'Content-Length':str(2*1024*1024)})
+  assert r.status_code==413
